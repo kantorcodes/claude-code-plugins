@@ -1,0 +1,829 @@
+"""`imgopt candidates`: try the ladder on each input, measure, gate, pick, cache.
+
+Per input, a folder under --out holds the source copy, the prepared
+reference (reference.png, what the pick is measured against), the pixel
+inputs the ladder reads (written only when a rung needs them), the
+candidates and metrics.json. metrics.json is both the cache (each
+candidate keyed by input and reference hashes, settings and tool versions,
+so a re-run only redoes what changed) and the record that `sheet` and
+`apply` read. It is rewritten after every candidate with ``complete``
+false, so an interrupted run resumes from its last finished candidate and
+is not applied; the finished record says ``complete`` true. run.json names
+the inputs and settings of the last run: `load_records` keeps only the
+complete records that match it, and `stale_records` says why it left each
+other folder out. Schema: see SCHEMA. prepared.json keys what a run
+prepares before any rung (reference.png, the source copy, the source's
+colour count and sRGB shift) by everything they depend on
+(_preparation_key): while it matches, a re-run reuses them instead of
+decoding again. It is removed before they are rewritten and written last,
+so a run stopped in between leaves no key and the next one prepares again.
+
+A source that cannot be read or whose colour profile cannot be converted
+(imaging.READ_FAILURES: also 16-bit files, content that does not match its
+extension, a --resize that would upscale or keep the width, and a file whose
+bytes match a lossy variant imgopt produced) is skipped by run(): it logs the reason, replaces
+any earlier record of that file with one that names the skip (``skipped``),
+and carries on, so callers compare len(records) with len(inputs) to learn
+that files were skipped. A record whose every candidate errored
+(all_errored) is a problem too.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shlex
+import shutil
+import tempfile
+import threading
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+
+from . import compare as CP
+from . import gates as G
+from . import ladder, metrics
+from . import store as ST
+from .formats import EXT_BY_FORMAT, command_line, format_of, subdir_name
+from .imaging import (READ_FAILURES, ImagingError, display_pixels, flatten, metadata_kinds, read_facts,
+                      resized_size, srgb_shift)
+from .store import sha256  # also `candidates.sha256`, which `apply` and the tests import
+from .tools import describe
+from .workdirs import folder_size, mark, replace_with
+
+SCHEMA = 1
+# Bump when a cached record would be wrong or lack a key. 7: SSIM compares gray on a pedestal (metrics.SSIM_GRAY);
+# 6: svgo keeps <desc> and empty groups;
+# 5: every raster rung records metadata_removed; 3: svgo keeps ids, roles and classes; 2: a rung's kind
+# follows its input.
+CACHE_VERSION = 7
+PREPARED_FILE = "prepared.json"
+RUN_FILE = "run.json"  # the last `candidates` run in this --out: which inputs, which settings
+UNCALIBRATED = ("webp", "avif")
+NOT_SMALLER = "not smaller than the original, so not measured (an in-place pick must be smaller)"
+METRIC_TOOLS = ("ffmpeg", "ssimulacra2", "butteraugli_main")
+# Rung families (and single rungs) of one file measured at once. A file's rungs otherwise run one after
+# another, so the largest file in a set decides how long the whole run takes, however many files run in parallel.
+RUNG_THREADS = 3
+# A family stops descending after this many measured gate failures in a row. On 809 benchmark files (2026-10-12)
+# it skipped 45% of the rungs and changed 3 picks by 18 KB in all; stopping after one failure changed 21 by 608 KB.
+EARLY_STOP = 2
+# Besides its encoder, a cached verdict depends on whatever decoded, converted and compared the pixels.
+# butteraugli stays in the key though no gate reads it: a cached pick carries its butteraugli score, and jpeg-xl
+# ships it with ssimulacra2, so an upgrade of one is an upgrade of both.
+RASTER_VERDICT_TOOLS = frozenset({"pillow", *METRIC_TOOLS})
+SVG_VERDICT_TOOLS = frozenset({"pillow", "rsvg-convert"})
+
+
+@dataclass(frozen=True)
+class Options:
+    profile: str
+    out: Path
+    gates: G.Gates
+    refs: dict = field(default_factory=dict)  # input path -> the file its pick is measured against
+    ref_rev: str | None = None  # the revision --ref-rev extracted ``refs`` from, for messages
+    resize: int | None = None
+    out_format: str = "keep"
+    waived: tuple[str, ...] = ()
+    min_saving: int = 0
+    assume_srgb: bool = False  # the human compared a colour-tagged PNG in a browser: lossy rungs may drop its chunks
+    use_store: bool = True  # False for the bench: its timings must not come from the store
+
+
+def kb(n: int) -> str:
+    return f"{n / 1024:.1f} KB"
+
+
+def removes(cand: dict | None) -> str:
+    """"removes exif, icc" for a candidate that drops metadata, else "": every place that shows a choice says it,
+    because copyright and credit live there."""
+    return f"removes {', '.join(cand['metadata_removed'])}" if cand and cand.get("metadata_removed") else ""
+
+
+def all_errored(record: dict) -> bool:
+    """Every candidate failed to encode or measure: a tool problem, not "nothing passed the gates"."""
+    return bool(record["candidates"]) and all("error" in c for c in record["candidates"])
+
+
+def pick_of(record: dict) -> dict | None:
+    """The picked candidate, or None. Without a pick, a candidate that has no file (it errored) is not it."""
+    if not record.get("pick"):
+        return None
+    return next((c for c in record["candidates"] if c.get("file") == record.get("pick")), None)
+
+
+def choice_of(record: dict) -> dict | None:
+    """The candidate this file will be written as: the one `choose` set, else the gates' pick. ``choice`` names its
+    variant by key, because a choice outlives re-runs and partial records, and only the key names the variant
+    itself (verdicts use it too); ``pick`` names a file, because a pick belongs to its record alone. A choice whose
+    key is not among the candidates counts as no choice."""
+    key = record.get("choice")
+    chosen = next((c for c in record["candidates"] if c.get("key") == key), None) if key else None
+    return chosen or pick_of(record)
+
+
+def write_run(out: Path, inputs: list[Path], opts: Options) -> None:
+    """Record which inputs and settings this run has; `load_records` keeps only what matches it."""
+    run = {"schema": SCHEMA, "inputs": sorted(str(Path(p).resolve()) for p in inputs), "profile": opts.profile,
+           "resize": opts.resize, "format": opts.out_format,
+           "assume_srgb": opts.assume_srgb}
+    replace_with(out / RUN_FILE, lambda tmp: tmp.write_text(json.dumps(run, indent=1)))
+
+
+def _scan(out: Path) -> tuple[list[tuple[Path, dict]], list[str]]:
+    run_path = Path(out) / RUN_FILE
+    run = json.loads(run_path.read_text()) if run_path.is_file() else None
+    current, stale = [], []
+    for path in sorted(Path(out).glob("*/metrics.json")):
+        record = json.loads(path.read_text())
+        name = path.parent.name
+        if "skipped" in record:
+            stale.append(f"{name}: skipped: {record['skipped']}")
+        elif not record.get("complete", True):
+            stale.append(f"{name}: interrupted before its last candidate")
+        elif run is None:  # a folder written by hand (tests) has no manifest: every complete record counts
+            current.append((path.parent, record))
+        elif record["source"]["path"] not in run["inputs"]:
+            stale.append(f"{name}: {Path(record['source']['path']).name} is not in the last run")
+        elif (record.get("profile"), record.get("resize"), record.get("format_requested", run["format"]),
+              record.get("assume_srgb", False)) != (
+                run["profile"], run["resize"], run["format"], run.get("assume_srgb", False)):
+            stale.append(f"{name}: made with other settings than the last run")
+        else:
+            current.append((path.parent, record))
+    return current, stale
+
+
+def load_records(out: Path) -> list[tuple[Path, dict]]:
+    """The complete records of the last run (``RUN_FILE``); what `sheet` and `apply` act on."""
+    return _scan(out)[0]
+
+
+def stale_records(out: Path) -> list[str]:
+    """Record folders ``load_records`` leaves out, with why: other inputs or settings, interrupted, or skipped."""
+    return _scan(out)[1]
+
+
+def write_record(folder: Path, record: dict) -> None:
+    replace_with(folder / "metrics.json", lambda tmp: tmp.write_text(json.dumps(record, indent=1)))
+
+
+def _record_skip(folder: Path, why: str) -> None:
+    """Replace the record of an input this run skipped. Its run.json entry was written before the file was
+    reached, so an earlier record left in place would pass for this run's in `sheet` and `apply`. Its cached
+    candidates are for content that is gone or unreadable, so nothing worth keeping is lost."""
+    if folder.is_dir():
+        write_record(folder, {"schema": SCHEMA, "complete": False, "skipped": why, "candidates": []})
+
+
+def _read_record(path: Path) -> dict:
+    """The record at ``path`` as it was left, complete or partial; empty when there is none or it is unreadable."""
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _previous(record: dict) -> tuple[dict, str | None]:
+    """(the last record's candidates by key, the key of the variant someone chose by hand, if any). A partial
+    record, written while a run measures, carries the choice forward too, so an interrupted run keeps it."""
+    return ({c["key"]: c for c in record.get("candidates", []) if isinstance(c, dict) and "key" in c},
+            record.get("choice"))
+
+
+PIXEL_FILES = {"pixels": "pixels.png", "pixels_flat": "pixels_flat.png", "pixels_gray": "pixels_gray.png",
+               "pixels_ppm": "pixels.ppm"}
+
+
+class _Pixels:
+    """One source's prepared pixels for this run, each made on first use and once, whichever rung thread asks
+    first: decoding, the sRGB conversion and a resize cost seconds on a large photo, and a run whose candidates
+    all come from the working folder or the store needs none of them."""
+
+    def __init__(self, src: Path, ref_path: Path, resize: int | None, flatten_ref: bool, folder: Path,
+                 ref_is_source: bool):
+        self.src, self.ref_path, self.resize, self.flatten_ref, self.folder = src, ref_path, resize, flatten_ref, folder
+        self.ref_is_source = ref_is_source  # the reference has the source's bytes (no --ref, or the same file)
+        self._made: dict = {}
+        self._lock = threading.RLock()  # a preparation may ask for another one (the reference is the source)
+
+    def _once(self, name: str, make):
+        with self._lock:
+            if name not in self._made:
+                self._made[name] = make()
+            return self._made[name]
+
+    def source(self):
+        return self._once("source", lambda: display_pixels(self.src, width=self.resize))
+
+    def reference(self):
+        """The reference as displayed, at the encoded width; without --ref it is the source."""
+        return self._once("reference", lambda: display_pixels(self.ref_path, width=self.resize)
+                          if self.ref_path != self.src else self.source())
+
+    def measured(self):
+        """What candidates are compared with: the reference, flattened onto white for a JPEG made from alpha."""
+        return self._once("measured", lambda: flatten(self.reference(), "white").convert("RGBA")
+                          if self.flatten_ref else self.reference())
+
+    def shown(self):
+        """The reference as stored, which the reviewer one-liner compares: the prepared one unless resized."""
+        return self._once("shown", lambda: display_pixels(self.ref_path) if self.resize else self.reference())
+
+    def reference_cache(self, measure_dir: Path) -> metrics.ReferenceCache:
+        """The reference prepared for measuring, made in the first caller's measurement folder (one per run)."""
+        return self._once("reference_cache", lambda: metrics.ReferenceCache(self.measured(), measure_dir))
+
+    def path(self, name: str) -> Path:
+        """The file a rung's encoder reads (``Rung.input``): the source itself, or a pixel file written the first
+        time a rung that reads it encodes."""
+        if name == "source":
+            return self.src
+        flat = lambda: self._once("flat", lambda: flatten(self.source(), "white"))
+        image = {"pixels": self.source, "pixels_flat": flat, "pixels_gray": lambda: flat().convert("L"),
+                 "pixels_ppm": flat}[name]
+
+        def write() -> Path:
+            target = self.folder / PIXEL_FILES[name]
+            image().save(target)
+            return target
+        return self._once(name, write)
+
+
+def keyed_tools(rung: ladder.Rung) -> list[str]:
+    """Every tool whose version can change this rung's cached result: the encoder and the verdict tools."""
+    return sorted(rung.tools | (SVG_VERDICT_TOOLS if rung == ladder.SVG_RUNG else RASTER_VERDICT_TOOLS))
+
+
+def _key(src_hash: str, ref_hash: str, opts: Options, rung: ladder.Rung, tools: dict) -> str:
+    names = keyed_tools(rung)
+    payload = {"v": CACHE_VERSION, "src": src_hash, "ref": ref_hash, "resize": opts.resize,
+               "format": opts.out_format, "rung": [rung.label, rung.tool, list(rung.args), rung.input,
+                                                   rung.post_oxipng],
+               "tools": {n: tools[n].cache_id for n in names if n in tools and tools[n].ok}}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _preparation_key(src_hash: str, ref_hash: str, opts: Options, tools: dict) -> str:
+    """What the files a run prepares before any rung depend on: the source and reference bytes, the resize, the
+    requested format (it decides a flatten onto white), the Pillow build that decodes and converts, and
+    CACHE_VERSION."""
+    pillow = tools.get("pillow")
+    payload = {"v": CACHE_VERSION, "src": src_hash, "ref": ref_hash, "resize": opts.resize,
+               "format": opts.out_format, "pillow": pillow.cache_id if pillow is not None and pillow.ok else None}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _available(rung: ladder.Rung, tools: dict) -> bool:
+    return all(n in tools and tools[n].ok for n in rung.tools)
+
+
+def _reusable(old: dict | None, folder: Path) -> bool:
+    """A cached candidate is reused when its file is still there, and so is an encoder's own refusal of this
+    input (same key = same input and build). Other errors (timeouts, a tool that could not start) are retried."""
+    if not old:
+        return False
+    if "error" in old:
+        return old.get("error_kind") == "refused"
+    return (folder / old["file"]).is_file()
+
+
+def _perfect(rec: dict) -> dict:
+    rec.update(identical=True, ssim=1.0, ssim_white=1.0, ss2=100.0, band=0.0, butteraugli=0.0)
+    return rec
+
+
+def _run_rung(rung, key, folder, facts, source_kinds, pixels, tools, can_measure, size_limit, measure_dir) -> dict:
+    rec = {"key": key, "label": rung.label, "tool": rung.tool, "kind": rung.kind, "band_gated": rung.palette}
+    try:
+        out = ladder.generate(rung, inputs={rung.input: pixels.path(rung.input)}, out_dir=folder, tools=tools)
+    except ladder.EncodeError as error:
+        rec["error"] = str(error)
+        if isinstance(error, ladder.EncoderRefused):
+            rec["error_kind"] = "refused"
+        return rec
+    rec["file"], rec["size"] = out.name, out.stat().st_size
+    try:
+        return _judge(rec, rung, out, facts, source_kinds, pixels, tools, can_measure, size_limit, measure_dir)
+    except READ_FAILURES as error:
+        rec["error"] = str(error)
+        return rec
+
+
+def _judge(rec, rung, out, facts, source_kinds, pixels, tools, can_measure, size_limit, measure_dir) -> dict:
+    """Read the encoded file and fill in its metadata verdict and scores. ``size_limit`` is the source size of
+    an in-place job: a lossy candidate that is not smaller cannot be picked, so it is not measured."""
+    ofacts = read_facts(out)
+    rec["progressive"] = ofacts.progressive
+    removed = sorted(source_kinds - metadata_kinds(out))
+    if removed:
+        rec["metadata_removed"] = removed
+    if rung.kind == "lossless":  # made from the source file, so its metadata must survive
+        ok, why = metrics.metadata_preserved(facts, ofacts)
+        if not ok:
+            rec["discarded"] = why
+            return rec
+    if facts.format == "gif" or facts.frames > 1:
+        if not metrics.frames_identical(pixels.src, out):
+            rec["discarded"] = f"{rung.tool} changed the frames"
+        elif not pixels.ref_is_source:
+            rec["discarded"] = "the reference is not the source; GIFs and other animated images support only lossless identity"
+        else:
+            _perfect(rec)
+        return rec
+    cand, ref_img = display_pixels(out), pixels.measured()
+    rec["identical"] = cand.size == ref_img.size and cand.tobytes() == ref_img.tobytes()
+    if rec["identical"]:
+        return _perfect(rec)
+    if rung.kind == "lossless":
+        rec["kind"] = "lossy"
+    if size_limit is not None and rec["size"] >= size_limit:
+        rec["discarded"] = NOT_SMALLER
+        return rec
+    if not can_measure:
+        rec["discarded"] = "pixels differ and the metric tools are absent (lossless profile)"
+        return rec
+    try:
+        s = metrics.measure(ref_img, cand, tools, measure_dir, ref_cache=pixels.reference_cache(measure_dir))
+    except metrics.MetricError as error:
+        rec["error"] = str(error)
+        return rec
+    rec.update(ssim=s.ssim, ssim_white=s.ssim_white, ss2=s.ss2, band=s.band)
+    return rec
+
+
+def _svg_rung(rung, key, folder, src, tools) -> dict:
+    rec = {"key": key, "label": rung.label, "tool": rung.tool, "kind": "lossless", "band_gated": False}
+    try:
+        out = ladder.generate(rung, inputs={"source": src}, out_dir=folder, tools=tools)
+        rec["file"], rec["size"], rec["progressive"] = out.name, out.stat().st_size, False
+        if not metrics.svg_identical(tools["rsvg-convert"].path, src, out, folder):
+            rec["discarded"] = "svgo changed the rendering"
+        elif lost := metrics.svg_semantics_lost(src, out):
+            rec["discarded"] = f"svgo {lost} (ids, roles and aria attributes must survive)"
+        else:
+            _perfect(rec)
+    except (ladder.EncodeError, metrics.MetricError) as error:
+        rec["error"] = str(error)
+        if isinstance(error, ladder.EncoderRefused):
+            rec["error_kind"] = "refused"
+    return rec
+
+
+def _reviewer_check(rec: dict, ref_path: Path, ref_facts, ref_shown, folder: Path, tools: dict) -> None:
+    """Record the SSIM a reviewer's ffmpeg one-liner (`compare`) prints for this candidate as
+    ``ssim_evidence``, or None with ``evidence_note`` saying why ffmpeg alone cannot reproduce it.
+    A failed ffmpeg run is also marked ``evidence_failed``, so the next run checks again (see _reuse).
+    ``ref_shown()`` gives the reference's display pixels at its own size, as the one-liner compares the files as
+    stored; it is called only here, so a run whose picks need no check never prepares them."""
+    new = folder / rec["file"]
+    ri, ni = ref_shown(), display_pixels(new)
+    obstacles = CP.reviewer_obstacles(ref_facts, read_facts(new), ri.size, ni.size)
+    rec["ssim_evidence"] = None
+    if obstacles:
+        rec["evidence_note"] = "; ".join(obstacles)
+        return
+    try:
+        rec["ssim_evidence"], _ = CP.reviewer_check(tools["ffmpeg"].path, ref_path, new, ri, ni)
+    except metrics.MetricError as error:
+        rec["evidence_note"] = f"ffmpeg could not read the pair ({error})"
+        rec["evidence_failed"] = True
+
+
+def _reuse(old: dict) -> dict:
+    """A cached candidate as recorded, except a reviewer check whose ffmpeg run failed, which is redone."""
+    rec = dict(old)
+    if rec.pop("evidence_failed", False):
+        rec.pop("ssim_evidence", None)
+        rec.pop("evidence_note", None)
+    return rec
+
+
+def _pick(cands: list[dict], gates: G.Gates, check) -> dict | None:
+    """The smallest passing candidate whose Evidence SSIM also clears the SSIM floor.
+
+    ffmpeg decodes JPEG differently from Pillow (up to about 1e-3), so a pick at a gate SSIM of 0.9801
+    could show a reviewer 0.979. Only picks are checked, one ffmpeg run each: a pick that fails is marked
+    failed and the next one is tried. A cached candidate keeps its ``ssim_evidence``, already gated.
+    """
+    while (chosen := G.pick(cands)) is not None:
+        if gates.ssim is None or chosen.get("identical") or "ssim_evidence" in chosen:
+            return chosen
+        check(chosen)
+        chosen["pass"], chosen["reason"] = G.evaluate(chosen, gates)
+        if chosen["pass"]:
+            return chosen
+    return None
+
+
+def _no_pick_reason(cands: list[dict], opts: Options) -> str:
+    """Why nothing was picked, with the closest measured candidate so the human can judge the gap.
+    A file whose candidates all errored has a tool problem (run() reports it), not a quality question."""
+    why = "no candidate passed the gates"
+    if cands and all(c.get("error") for c in cands):
+        return why + "; every candidate errored"
+    live = [c for c in cands if not c.get("error")]
+    if live and all(c.get("discarded") == NOT_SMALLER for c in live):
+        return "no candidate is smaller than the original"
+    measured = [c for c in cands if c.get("ssim") is not None and not c.get("error") and not c.get("discarded")]
+    if measured:
+        best = max(measured, key=lambda c: (c["ssim"], c["ss2"]))
+        why += (f"; closest: {best['label']} at SSIM {best['ssim']:.4f}, ss2 {best['ss2']:.1f} "
+                f"(failed: {best['reason']})")
+    if opts.resize and opts.profile == "high":
+        medium = G.PROFILES["medium"]
+        why += (f"; for a resize, --profile medium (SSIM {medium.ssim:g}, ss2 {medium.ss2:g}) is the usual "
+                "next step if the human accepts that floor")
+    return why
+
+
+def _process(src: Path, opts: Options, tools: dict) -> tuple[dict, dict[str, int]]:
+    """The record of ``src``, and where its candidates came from: {"here": reused from this working folder,
+    "store": taken from the variant store, "encoded": made now}."""
+    folder = opts.out / subdir_name(src)
+    ref_path = opts.refs.get(src, src)
+    src_hash, ref_hash = sha256(src), sha256(ref_path)
+    lossy_run = opts.profile != "lossless"
+    if lossy_run and src not in opts.refs and ST.produced_lossy(src_hash):
+        raise ImagingError(f"{src.name}: its bytes match a lossy variant imgopt produced, so it was compressed "
+                           "once already and measuring it again would stack a second lossy pass; measure against "
+                           "the original with --ref-rev <commit before it was placed> or --ref <original>, or "
+                           "leave it out of the set")
+    # a revision after the pick was committed, or the pick itself
+    if lossy_run and src in opts.refs and ST.produced_lossy(ref_hash):
+        baseline = f"its content at {opts.ref_rev}" if opts.ref_rev else str(ref_path)
+        raise ImagingError(f"{src.name}: the baseline ({baseline}) matches a lossy variant imgopt produced, so "
+                           "measuring against it would stack a second lossy pass; use a baseline from before "
+                           "that variant was placed")
+    fmt = format_of(src)
+    notes: list[str] = []
+    can_measure = all(n in tools and tools[n].ok for n in ("ffmpeg", "ssimulacra2"))
+    previous, chosen_key = _previous(_read_record(folder / "metrics.json"))
+    copy = folder / f"source{src.suffix.lower()}"
+    key = _preparation_key(src_hash, ref_hash, opts, tools)
+    known = _read_record(folder / PREPARED_FILE)
+    if known.get("key") != key or not copy.is_file() or (fmt != "svg" and not (folder / "reference.png").is_file()):
+        known = {}
+    pixels = None
+    if fmt == "svg":
+        if opts.profile != "lossless":
+            notes.append("SVG gets the lossless svgo rung only")
+        rungs, target_fmt, facts = [ladder.SVG_RUNG], "svg", None
+        source_info = {"format": "svg", "width": None, "height": None, "colors": None, "frames": 1}
+        folder.mkdir(parents=True, exist_ok=True)
+    else:
+        # Counting colours decodes every pixel; prepared.json keeps the count while its key holds.
+        facts = read_facts(src, count_colours="colors" not in known)
+        if "colors" in known:
+            facts = replace(facts, colors=known["colors"])
+        source_kinds = metadata_kinds(src)
+        ref_facts = read_facts(ref_path) if src in opts.refs else facts
+        if opts.resize and opts.resize == facts.display_width == ref_facts.display_width:
+            raise ImagingError(f"{src.name}: already displays {opts.resize} px wide, so there is nothing to "
+                               "resize (optimize it without --resize)")
+        plan = ladder.plan(facts, profile=opts.profile, out_format=opts.out_format, resize=opts.resize,
+                           assume_srgb=opts.assume_srgb)
+        notes += plan.notes
+        rungs, target_fmt = plan.rungs, plan.out_format
+        source_info = {"format": facts.format, "width": facts.width, "height": facts.height, "colors": facts.colors,
+                       "frames": facts.frames}
+        pixels = _Pixels(src, ref_path, opts.resize, target_fmt == "jpeg" and facts.has_alpha, folder,
+                         ref_is_source=ref_hash == src_hash)
+        if not known:
+            pixels.measured()  # before the folder exists: an unconvertible profile skips the file cleanly
+        folder.mkdir(parents=True, exist_ok=True)
+    if not known:
+        (folder / PREPARED_FILE).unlink(missing_ok=True)  # a run stopped from here on leaves no key
+        if pixels is not None:
+            pixels.measured().save(folder / "reference.png")
+        shutil.copyfile(src, copy)
+        known = {"key": key, "colors": facts.colors if facts else None,
+                 "srgb_shift": list(srgb_shift(src, pixels.source())) if facts and facts.device_profile else None}
+        replace_with(folder / PREPARED_FILE, lambda tmp: tmp.write_text(json.dumps(known)))
+    if facts and facts.device_profile:
+        mean, peak = known["srgb_shift"]
+        notes.append(f"device colour profile '{facts.icc_desc}': pixel candidates are converted to sRGB "
+                     f"(the conversion alone shifts mean {mean:.1f}, max {peak} of 255)")
+    if facts and facts.orientation != 1:
+        notes.append(f"EXIF orientation {facts.orientation}: lossless candidates keep the tag, "
+                     "pixel candidates have it applied")
+    if facts and opts.resize:
+        width, height = resized_size((facts.display_width, facts.display_height), opts.resize)
+        notes.append(f"resized {facts.width}x{facts.height} -> {width}x{height} (Lanczos); "
+                     "the reference is scaled the same way")
+    if src in opts.refs:
+        notes.append(f"measured against {ref_path}")
+    skipped = [r for r in rungs if not _available(r, tools)]
+    missing = sorted({n for r in skipped for n in r.tools if not (n in tools and tools[n].ok)})
+    unwaived = [n for n in missing if n not in opts.waived]
+    if unwaived:  # the strict tool check must have blocked these; going on would silently skip rungs
+        raise RuntimeError(f"{src.name}: the ladder needs {', '.join(unwaived)}, which the tool check neither "
+                           "found nor saw waived (an imgopt bug: tools.requirements and the ladder disagree)")
+    waived_here = [n for n in missing if n in opts.waived]
+    if waived_here:
+        n_waived = sum(1 for r in skipped if set(r.tools) & set(waived_here))
+        notes.append(f"skipped {n_waived} rung(s), tools waived: {', '.join(waived_here)}")
+    # A same-format job rewrites the source itself (a resize too); only a new format gets a new name.
+    target = src if target_fmt == fmt else src.with_suffix(EXT_BY_FORMAT[target_fmt])
+    size = src.stat().st_size
+    in_place = target == src and not opts.resize
+    cands = []
+    origins = dict.fromkeys(("here", "store", "encoded"), 0)
+    with tempfile.TemporaryDirectory(dir=folder) as measure_dir:
+        def candidate(rung: ladder.Rung, key: str) -> tuple[dict, str]:
+            """One rung's record and where it came from. Each rung writes only its own output file."""
+            old = previous.get(key)
+            if _reusable(old, folder):
+                return _reuse(old), "here"
+            stored = ST.get(key) if opts.use_store else None
+            if stored is not None and ST.restore(stored, folder):
+                return _reuse(stored), "store"
+            if fmt == "svg":
+                return _svg_rung(rung, key, folder, src, tools), "encoded"
+            return _run_rung(rung, key, folder, facts, source_kinds, pixels, tools, can_measure,
+                             size if in_place else None, Path(measure_dir)), "encoded"
+
+        done: dict[str, tuple[dict, str]] = {}
+        lock = threading.Lock()
+
+        def descend(unit: list[ladder.Rung]) -> int:
+            """Measure a family top-down (or one single rung). After EARLY_STOP measured gate failures in a row
+            the lower levels are not measured, except the variant someone chose by hand. Errors and unmeasured
+            discards neither count nor reset. Returns how many levels were not measured."""
+            streak = skipped = 0
+            for rung in unit:
+                key = _key(src_hash, ref_hash, opts, rung, tools)
+                stopped = streak >= EARLY_STOP
+                if stopped and key != chosen_key:
+                    skipped += 1
+                    continue
+                rec, origin = candidate(rung, key)
+                rec["pass"], rec["reason"] = G.evaluate(rec, opts.gates)
+                if not stopped:  # the chosen variant, measured past the stop, does not restart the descent
+                    streak = 0 if rec["pass"] else streak + ("ssim" in rec)
+                with lock:  # the partial record lets an interrupted run resume (it is read by key, not order)
+                    done[rung.label] = (rec, origin)
+                    write_record(folder, {"schema": SCHEMA, "complete": False,
+                                          **({"choice": chosen_key} if chosen_key else {}),
+                                          "candidates": [r for r, _ in done.values()]})
+            return skipped
+
+        live = [r for r in rungs if _available(r, tools)]
+        units: dict[str, list[ladder.Rung]] = {}
+        for rung in live:
+            units.setdefault(rung.family or rung.label, []).append(rung)
+        # On an error or an interrupt the units not yet started are cancelled rather than run to the end.
+        pool = ThreadPoolExecutor(max_workers=RUNG_THREADS)
+        try:
+            skipped = dict(zip(units, pool.map(descend, units.values())))
+        finally:
+            pool.shutdown(cancel_futures=True)
+        for name, n in skipped.items():
+            if n:
+                notes.append(f"{name}: stopped after {EARLY_STOP} levels in a row failed the gates; {n} lower "
+                             "level(s) not measured")
+        for rung in (r for r in live if r.label in done):  # in ladder order, whatever order they finished in
+            rec, origin = done[rung.label]
+            cands.append(rec)
+            origins[origin] += 1
+        if fmt == "svg":
+            chosen = G.pick(cands)
+        else:
+            chosen = _pick(cands, opts.gates,
+                           lambda rec: _reviewer_check(rec, ref_path, ref_facts, pixels.shown, folder, tools))
+            # butteraugli is reported only, so it runs on the pick alone (a cached pick may have it already)
+            if chosen and "ssim" in chosen and not chosen.get("identical") and chosen.get("butteraugli") is None:
+                chosen["butteraugli"] = metrics.butteraugli_score(pixels.measured(),
+                                                                  display_pixels(folder / chosen["file"]),
+                                                                  tools, Path(measure_dir))
+    # Someone's choice (the pick too: a by-hand keep under the floors) outlives a re-run while its variant (its
+    # key) is still measured here.
+    choice = next((c for c in cands if chosen_key and c.get("key") == chosen_key and c.get("file") and "size" in c
+                   and not c.get("error") and not c.get("discarded")), None)
+    verdict, why = G.verdict(size, choice or chosen, in_place=in_place, replaces_source=target == src,
+                             min_saving=opts.min_saving, by_hand=choice is not None)
+    if chosen is None and choice is None:
+        why = _no_pick_reason(cands, opts)
+    record = {
+        "schema": SCHEMA,
+        "source": {"path": str(src), "sha256": src_hash, "size": size, **source_info},
+        "ref": {"path": str(ref_path), "sha256": ref_hash, "size": ref_path.stat().st_size},
+        "profile": opts.profile, "gates": asdict(opts.gates), "resize": opts.resize,
+        "min_saving": opts.min_saving, "assume_srgb": opts.assume_srgb,
+        "format_requested": opts.out_format, "format": target_fmt, "target": str(target),
+        "uncalibrated": target_fmt in UNCALIBRATED,
+        "waived": list(opts.waived), "notes": notes,
+        "tools": {n: {"path": t.path, "version": t.version, "id": t.cache_id}
+                  for n, t in sorted(tools.items()) if t.ok},
+        "candidates": cands, "pick": chosen["file"] if chosen else None,
+        **({"choice": choice["key"]} if choice else {}),
+        "verdict": verdict, "verdict_reason": why, "complete": True,
+    }
+    write_record(folder, record)
+    if opts.use_store:
+        for cand in cands:
+            ST.put(cand, folder, source_sha=src_hash, ref_sha=ref_hash)
+    return record, origins
+
+
+def _fmt_score(c: dict) -> str:
+    if "ssim" not in c:
+        return f"{'-':>8} {'-':>6} {'-':>11}"
+    band = f"{c['band']:.1f} {'gated' if c.get('band_gated') else 'rep.'}"
+    return f"{c['ssim']:8.4f} {c['ss2']:6.1f} {band:>11}"
+
+
+def print_record(record: dict, log=print) -> None:
+    s = record["source"]
+    dims = f"{s['width']}x{s['height']} " if s.get("width") else ""
+    colours = f", {s['colors']} colours" if s.get("colors") else ""
+    log(f"\n== {s['path']}  {kb(s['size'])}  {dims}{s['format']}{colours}")
+    if record["ref"]["path"] != s["path"]:
+        log(f"   baseline: {record['ref']['path']}  {kb(record['ref']['size'])} "
+            "(scores are against it; sizes below are this file's)")
+    for note in record["notes"]:
+        log(f"   note: {note}")
+    log(f"   {'candidate':22} {'size':>9} {'saved':>6} {'SSIM':>8} {'ss2':>6} {'banding':>11}  result")
+    for c in sorted(record["candidates"], key=lambda c: c.get("size", 1 << 62)):
+        if "size" in c:
+            saved = f"{(c['size'] - s['size']) / s['size']:+.0%}"
+            size = kb(c["size"])
+        else:
+            saved, size = "", ""
+        result = "PASS" + (" (identical)" if c.get("identical") else "") if c["pass"] else f"fail: {c['reason']}"
+        log(f"   {c['label']:22} {size:>9} {saved:>6} {_fmt_score(c)}  {result}")
+    # What will be written is the choice (choice_of): the pick, or a variant chosen by hand that outlived a re-run.
+    pick, chosen = pick_of(record), choice_of(record)
+    pick_text = f"{pick['label']} ({kb(pick['size'])})" if pick else "none"
+    by_hand = (f"   choice: {chosen['label']} ({kb(chosen['size'])})"
+               if chosen is not None and chosen is not pick else "")
+    log(f"   pick: {pick_text}{by_hand}   verdict: {record['verdict']} ({record['verdict_reason']})")
+    if chosen and chosen.get("metadata_removed"):
+        log(f"   {'choice' if by_hand else 'pick'} removes metadata: {', '.join(chosen['metadata_removed'])} "
+            "(say so to the human: copyright and credit live there)")
+    if chosen and "ssim_evidence" in chosen:
+        evidence = (f"{chosen['ssim_evidence']:.6f}" if chosen["ssim_evidence"] is not None
+                    else f"not reproducible with ffmpeg alone ({chosen['evidence_note']})")
+        log(f"   Evidence SSIM (luma): {evidence}")
+
+
+def savings_lines(records: list[dict]) -> list[str]:
+    """What a human needs to decide what is worth doing: the applied picks ranked by bytes saved with the
+    cumulative share, how many save little, and the folders that hold the most saving."""
+    saved = sorted(((max(0, r["source"]["size"] - choice_of(r)["size"]), r) for r in records
+                    if r["verdict"] == "apply" and choice_of(r)), key=lambda t: -t[0])
+    total = sum(s for s, _ in saved)
+    if not saved or total <= 0:
+        return []
+    marks, running, steps = [], 0, {5, 10, 20, 30, 50, len(saved)}
+    for i, (s, _) in enumerate(saved, 1):
+        running += s
+        if i in steps:
+            marks.append(f"top {i} = {kb(running)} ({running / total:.0%})")
+    lines = ["Savings, largest first: " + ", ".join(marks)]
+    small = []
+    for limit in (1024, 3072, 10240):
+        under = [s for s, _ in saved if s < limit]
+        small.append(f"under {limit // 1024} KB: {len(under)} ({kb(sum(under))})")
+    lines.append("Picks saving " + "; ".join(small))
+    by_folder: dict[str, list[int]] = {}
+    for s, r in saved:
+        by_folder.setdefault(str(Path(r["source"]["path"]).parent), []).append(s)
+    top = sorted(by_folder.items(), key=lambda kv: -sum(kv[1]))[:8]
+    lines.append("Largest by folder: " + "; ".join(f"{folder} {kb(sum(v))} ({len(v)} files)" for folder, v in top))
+    return lines
+
+
+def summarize(records: list[dict], out: Path, script: Path, tools: dict, log=print) -> None:
+    applied = [r for r in records if r["verdict"] == "apply"]
+    before = sum(r["source"]["size"] for r in applied)
+    after = sum(choice_of(r)["size"] for r in applied)
+    total_before = sum(r["source"]["size"] for r in records)
+    total_after = sum(choice_of(r)["size"] if r in applied else r["source"]["size"] for r in records)
+    # Signed like the comparison page's totals: a resized or converted pick can be larger than its original.
+    change = f" ({(total_after - total_before) / total_before:+.1%})" if total_before else ""
+    log(f"\n{len(records)} file(s), {kb(total_before)} -> {kb(total_after)}{change} overall; "
+        f"{len(applied)} to apply ({kb(before)} -> {kb(after)}), {len(records) - len(applied)} untouched.")
+    for line in savings_lines(records):
+        log(line)
+    based = [r for r in records if r["ref"]["path"] != r["source"]["path"]]
+    if based:
+        based_before = sum(r["ref"]["size"] for r in based)
+        based_after = sum(choice_of(r)["size"] if r in applied else r["source"]["size"] for r in based)
+        log(f"Against the baselines: {kb(based_before)} -> {kb(based_after)} for {len(based)} file(s).")
+    log(describe(tools))
+    if any(r["uncalibrated"] for r in records):
+        log("UNCALIBRATED FORMAT: WebP/AVIF output was never calibrated against these gates; "
+            "every sheet tile is required viewing.")
+    larger = [r for r in applied if choice_of(r)["size"] > r["source"]["size"]]
+    if larger:
+        log(f"LARGER: {len(larger)} pick(s) are larger than their original (a resize or format change was "
+            "asked for, so they still apply); "
+            "tell the human before applying: " + ", ".join(Path(r["source"]["path"]).name for r in larger))
+    waived = sorted({w for r in records for w in r["waived"]})
+    if waived:
+        log("WAIVED TOOLS (fewer candidates were tried, so picks may be larger than with them; state this in "
+            "any report): " + ", ".join(waived))
+    lossy = [r for r in applied if choice_of(r)["kind"] == "lossy"]
+    log(f"Working folder: {shlex.quote(str(out))} ({folder_size(out) / 1e6:.1f} MB); once its files are placed, "
+        f"offer the human its removal: {command_line(script, 'clean', out)}")
+    if lossy:
+        log(f"Next: {command_line(script, 'sheet', out)}   (view the required tiles, show the page; "
+            f"{len(lossy)} lossy choice(s) need the human's verdict, which `record` stores)")
+    elif applied:
+        log(f"Next: {command_line(script, 'apply', out)}   (all choices are lossless; no verdict needed)")
+    else:
+        log("Next: nothing to apply.")
+
+
+def _process_or_skip(src: Path, opts: Options, tools: dict) -> tuple[dict | None, str, dict[str, int]]:
+    """``_process`` for a worker process: a source that cannot be read comes back as its reason. Nothing here
+    prints; the parent logs, in input order."""
+    try:
+        record, origins = _process(Path(src), opts, tools)
+    except READ_FAILURES as error:
+        return None, str(error), {}
+    return record, "", origins
+
+
+def _results(inputs: list[Path], opts: Options, tools: dict, jobs: int, log):
+    """``_process_or_skip`` for each input, in input order, in ``jobs`` worker processes when it pays.
+
+    A sandbox can deny what a pool needs (semaphores, new processes): creating it or submitting the work then
+    raises, and the files are processed one at a time instead. Errors from ``_process`` itself surface later,
+    while the results are read, and are not caught here.
+    """
+    if jobs > 1 and len(inputs) > 1:
+        pool = None
+        try:
+            pool = ProcessPoolExecutor(max_workers=min(jobs, len(inputs)))
+            results = pool.map(_process_or_skip, inputs, [opts] * len(inputs), [tools] * len(inputs))
+        except (OSError, NotImplementedError) as error:
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+            log(f"parallel runs unavailable here ({error}); measuring one file at a time")
+        else:
+            with pool:
+                yield from results
+            return
+    for src in inputs:
+        yield _process_or_skip(src, opts, tools)
+
+
+def check_inputs(inputs: list[Path], opts: Options) -> list[tuple[Path, str]]:
+    """The inputs the ladder cannot serve, with why; nothing is written yet. When every input is refused the
+    request itself is wrong, so that is a UsageError naming the first file."""
+    refused = []
+    for src in inputs:
+        try:
+            ladder.check_job(format_of(src), profile=opts.profile, out_format=opts.out_format, resize=opts.resize)
+        except ladder.UsageError as error:
+            refused.append((Path(src), str(error)))
+    if inputs and len(refused) == len(inputs):
+        src, why = refused[0]
+        raise ladder.UsageError(f"{src.name}: {why}")
+    return refused
+
+
+def run(inputs: list[Path], opts: Options, tools: dict, log=print, script: Path | None = None,
+        jobs: int = 1) -> list[dict]:
+    """One record per input that could be prepared; a skipped input is logged and left out.
+
+    With ``jobs`` above 1 that many files are processed at once in separate processes; the log still
+    follows input order.
+
+    An input the ladder cannot serve is logged and left out; a request it cannot serve for any input is a
+    UsageError before anything is written.
+    """
+    inputs = [Path(p).resolve() for p in inputs]  # records and RUN_FILE name inputs by the same string
+    refused = check_inputs(inputs, opts)
+    for src, why in refused:
+        log(f"\n== {src}: skipped: {why}")
+    refused_paths = {src for src, _ in refused}
+    inputs = [p for p in inputs if Path(p) not in refused_paths]
+    mark(opts.out)
+    write_run(opts.out, inputs, opts)
+    records = []
+    origins: Counter = Counter()
+    for src, (record, error, origin) in zip(inputs, _results(inputs, opts, tools, jobs, log)):
+        origins.update(origin)
+        if record is None:
+            log(f"\n== {src}: skipped: {error}")
+            _record_skip(opts.out / subdir_name(src), error)
+            continue
+        print_record(record, log)
+        if all_errored(record):
+            log(f"   problem: every candidate errored, so this file was not optimized "
+                f"(first error: {record['candidates'][0]['error']})")
+        records.append(record)
+    summarize(records, opts.out, script or Path("imgopt.py"), tools, log)
+    here = f", {origins['here']} already in the working folder" if origins["here"] else ""
+    log(f"{origins['store']} variant(s) from the store, {origins['encoded']} encoded{here}.")
+    if opts.use_store:
+        removed, freed, left = ST.prune()
+        pruned = f"; pruned {removed} unused variant(s), {freed / 1e6:.1f} MB" if removed else ""
+        log(f"Variant store: {left / 1e6:.1f} MB at {ST.root()} (variants unused for {ST.MAX_AGE_DAYS} days "
+            f"go, and it stays under {ST.MAX_BYTES / 1e9:.0f} GB){pruned}")
+    return records
