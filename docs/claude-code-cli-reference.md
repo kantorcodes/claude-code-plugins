@@ -140,7 +140,7 @@ From the [official tools reference](https://code.claude.com/docs/en/tools-refere
 | `acceptEdits` | `--permission-mode acceptEdits` | Auto-approves file edits for the session |
 | `plan` | `--permission-mode plan` | Read-only — no modifications or commands |
 | `dontAsk` | `--permission-mode dontAsk` | **Auto-denies** tools unless pre-approved via `--allowedTools` |
-| `bypassPermissions` | `--dangerously-skip-permissions` | **Auto-approves** all tools (still protects `.git`, `.claude`, `.vscode`, `.idea` from writes) |
+| `bypassPermissions` | `--dangerously-skip-permissions` | Skips routine permission prompts, including writes to protected paths. Explicit deny rules and [actions no mode auto-approves](https://code.claude.com/docs/en/permission-modes#actions-no-mode-auto-approves) still apply. |
 
 **For subprocess invocations**, two safe patterns:
 
